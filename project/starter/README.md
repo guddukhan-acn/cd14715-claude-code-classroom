@@ -146,7 +146,8 @@ npm run build
 npm start <owner> <repo> <pr-number>
 
 # Example
-npm run dev -- facebook react 12345
+ls -l
+
 ```
 
 ### Testing
