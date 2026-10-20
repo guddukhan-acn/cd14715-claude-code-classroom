@@ -5,11 +5,15 @@ import { codeQualityAnalyzer } from './agents/code-quality-analyzer';
 import { testCoverageAnalyzer } from './agents/test-coverage-analyzer';
 import { refactoringSuggester } from './agents/refactoring-suggester';
 import { orchestratorPrompt } from './prompts/orchestrator.prompt';
+import { withRetry, withTimeout } from './utils/error-handler';
 
 export interface OrchestratorOptions {
   model?: string;
   maxTurns?: number;
   maxBudgetUsd?: number;
+  maxRetries?: number;
+  retryDelayMs?: number;
+  timeoutMs?: number;
 }
 
 export class CodeReviewOrchestrator {
@@ -35,43 +39,64 @@ Review this pull request:
 
 Return ONLY the final ReviewReport JSON.`;
 
-    let result: unknown;
+    const result = await withRetry(
+      () =>
+        withTimeout(
+          async () => {
+            let output: unknown;
 
-    for await (const message of query({
-      prompt,
-      options: {
-        model: this.options.model,
-        maxTurns: this.options.maxTurns ?? 30,
-        maxBudgetUsd: this.options.maxBudgetUsd,
-        mcpServers: mcpServersConfig,
-        agents: {
-          codeQualityAnalyzer,
-          testCoverageAnalyzer,
-          refactoringSuggester,
-        },
-        allowedTools: [
-          'Task',
-          'Read',
-          'Grep',
-          'Glob',
-          'Skill',
-          'mcp__github__*',
-          'mcp__eslint__*',
-        ],
-        outputFormat: {
-          type: 'json_schema',
-          schema: ReviewReportJSONSchema,
-        },
-      },
-    })) {
-      if (message.type === 'result') {
-        result = (message as any).structured_output ?? (message as any).result ?? (message as any).structuredOutput;
-      }
-    }
+            for await (const message of query({
+              prompt,
+              options: {
+                model: this.options.model,
+                maxTurns: this.options.maxTurns ?? 30,
+                maxBudgetUsd: this.options.maxBudgetUsd,
+                mcpServers: mcpServersConfig,
+                agents: {
+                  codeQualityAnalyzer,
+                  testCoverageAnalyzer,
+                  refactoringSuggester,
+                },
+                allowedTools: [
+                  'Task',
+                  'Read',
+                  'Grep',
+                  'Glob',
+                  'Skill',
+                  'mcp__github__*',
+                  'mcp__eslint__*',
+                ],
+                outputFormat: {
+                  type: 'json_schema',
+                  schema: ReviewReportJSONSchema,
+                },
+              },
+            })) {
+              if (message.type === 'result') {
+                const resultMessage = message as typeof message & {
+                  structured_output?: unknown;
+                  result?: unknown;
+                  structuredOutput?: unknown;
+                };
+                output =
+                  resultMessage.structured_output ??
+                  resultMessage.result ??
+                  resultMessage.structuredOutput;
+              }
+            }
 
-    if (!result) {
-      throw new Error('Claude did not return a structured review report');
-    }
+            if (output === undefined) {
+              throw new Error('Claude did not return a structured review report');
+            }
+
+            return output;
+          },
+          this.options.timeoutMs ?? 300_000,
+          `Review timed out after ${this.options.timeoutMs ?? 300_000}ms`
+        ),
+      this.options.maxRetries ?? 2,
+      this.options.retryDelayMs ?? 1000
+    );
 
     const report = typeof result === 'string' ? JSON.parse(result) : result;
     const validated = ReviewReportSchema.parse(report);
@@ -81,7 +106,7 @@ Return ONLY the final ReviewReport JSON.`;
       metadata: {
         ...validated.metadata,
         duration: Date.now() - start,
-      },
+      }
     };
   }
 }
